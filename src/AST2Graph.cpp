@@ -7,6 +7,7 @@
 #include <stack>
 #include <map>
 #include <utility>
+#include <cerrno>
 
 /* check the node type and children num */
 #define TYPE_CHECK(node, min, max,...) typeCheck(node, (const int[]){__VA_ARGS__}, sizeof((const int[]){__VA_ARGS__}) / sizeof(int), min, max)
@@ -44,6 +45,411 @@ static std::set<std::string> moduleInstances;
 static std::set<Node*> stmtsNodes;
 
 static std::map<std::string, std::pair<std::vector<Node*>, std::vector<AggrParentNode*>>> memoryMap;
+
+struct ChoiceDomain {
+  unsigned width;
+  PNode* node;
+  std::map<std::string, uint64_t> encodings;
+  std::map<uint64_t, std::string> names;
+};
+
+struct ChoiceValue {
+  std::string domain;
+  uint64_t encoding;
+};
+
+using ChoiceEnv = std::map<std::string, ChoiceValue>;
+using InstanceChoiceEnv = std::map<std::string, ChoiceEnv>;
+using InstanceModuleMap = std::map<std::string, std::string>;
+
+static std::map<std::string, ChoiceDomain> choiceDomains;
+static std::map<PNode*, std::map<std::string, std::string>> moduleChoicePorts;
+static std::stack<ChoiceEnv> choiceEnvStack;
+static std::stack<InstanceChoiceEnv> instanceChoiceEnvStack;
+
+[[noreturn]] static void choiceError(PNode* location, const char* format, ...) {
+  fprintf(stderr, "Error at line %d: ", location ? location->lineno : -1);
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fprintf(stderr, "\n");
+  fflush(stdout);
+  std::fflush(nullptr);
+  exit(EXIT_FAILURE);
+}
+
+static uint64_t parseChoiceEncoding(PNode* node) {
+  Assert(node && node->getExtraNum() > 0, "choice case %s has no encoding",
+         node ? node->name.c_str() : "<unknown>");
+  const std::string& text = node->getExtra(0);
+  if (text.empty() || text[0] == '-') {
+    choiceError(node, "choice case '%s' must use an unsigned encoding, got '%s'",
+                node->name.c_str(), text.c_str());
+  }
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+  if (errno == ERANGE || !end || *end != '\0') {
+    choiceError(node, "invalid encoding '%s' for choice case '%s'",
+                text.c_str(), node->name.c_str());
+  }
+  return static_cast<uint64_t>(value);
+}
+
+static bool choiceEncodingFits(unsigned width, uint64_t encoding) {
+  return width == 64 || encoding < (uint64_t{1} << width);
+}
+
+static void validateChoiceDomains(PNode* root) {
+  for (int i = 0; i < root->getChildNum(); ++i) {
+    PNode* domainNode = root->getChild(i);
+    if (domainNode->type != P_CHOICE_DOMAIN) continue;
+    if (domainNode->width < 1 || domainNode->width > 64) {
+      choiceError(domainNode, "choice domain '%s' width must be between 1 and 64, got %d",
+                  domainNode->name.c_str(), domainNode->width);
+    }
+    auto inserted = choiceDomains.emplace(domainNode->name,
+        ChoiceDomain{static_cast<unsigned>(domainNode->width), domainNode, {}, {}});
+    if (!inserted.second) {
+      choiceError(domainNode, "duplicate choice domain '%s'", domainNode->name.c_str());
+    }
+    ChoiceDomain& domain = inserted.first->second;
+    for (PNode* caseNode : domainNode->child) {
+      if (caseNode->type != P_CHOICE_CASE) {
+        choiceError(caseNode, "invalid declaration in choice domain '%s'",
+                    domainNode->name.c_str());
+      }
+      uint64_t encoding = parseChoiceEncoding(caseNode);
+      if (!choiceEncodingFits(domain.width, encoding)) {
+        choiceError(caseNode, "choice case '%s.%s' encoding %llu does not fit width %u",
+                    domainNode->name.c_str(), caseNode->name.c_str(),
+                    static_cast<unsigned long long>(encoding), domain.width);
+      }
+      if (!domain.encodings.emplace(caseNode->name, encoding).second) {
+        choiceError(caseNode, "duplicate choice case '%s' in domain '%s'",
+                    caseNode->name.c_str(), domainNode->name.c_str());
+      }
+      if (!domain.names.emplace(encoding, caseNode->name).second) {
+        choiceError(caseNode, "duplicate encoding %llu in choice domain '%s'",
+                    static_cast<unsigned long long>(encoding), domainNode->name.c_str());
+      }
+    }
+  }
+}
+
+static ChoiceValue resolveChoiceCase(PNode* location, const std::string& domainName,
+                                     const std::string& caseName) {
+  auto domainIt = choiceDomains.find(domainName);
+  if (domainIt == choiceDomains.end()) {
+    choiceError(location, "unknown choice domain '%s'", domainName.c_str());
+  }
+  auto caseIt = domainIt->second.encodings.find(caseName);
+  if (caseIt == domainIt->second.encodings.end()) {
+    choiceError(location, "unknown choice case '%s' in domain '%s'",
+                caseName.c_str(), domainName.c_str());
+  }
+  return ChoiceValue{domainName, caseIt->second};
+}
+
+static bool hasChoiceType(PNode* typeNode) {
+  if (!typeNode) return false;
+  if (typeNode->type == P_CHOICE_TYPE) return true;
+  for (PNode* childNode : typeNode->child) {
+    if (hasChoiceType(childNode)) return true;
+  }
+  return false;
+}
+
+static bool hasProbeType(PNode* typeNode) {
+  if (!typeNode) return false;
+  if (typeNode->isProbe) return true;
+  for (PNode* childNode : typeNode->child) {
+    if (hasProbeType(childNode)) return true;
+  }
+  return false;
+}
+
+static bool containsPNodeType(PNode* node, PNodeType type) {
+  if (!node) return false;
+  if (node->type == type) return true;
+  for (PNode* childNode : node->child) {
+    if (containsPNodeType(childNode, type)) return true;
+  }
+  return false;
+}
+
+static std::string choicePortDomain(PNode* port) {
+  if (!port || port->getChildNum() != 1) return "";
+  PNode* typeNode = port->getChild(0);
+  return typeNode->type == P_CHOICE_TYPE ? typeNode->name : "";
+}
+
+static void validateModuleChoicePorts(PNode* module) {
+  PNode* ports = module->getChild(0);
+  std::set<std::string> names;
+  for (PNode* port : ports->child) {
+    if (!names.insert(port->name).second) {
+      choiceError(port, "duplicate port '%s' in module '%s'",
+                  port->name.c_str(), module->name.c_str());
+    }
+    PNode* typeNode = port->getChild(0);
+    if (!hasChoiceType(typeNode)) continue;
+    std::string domain = choicePortDomain(port);
+    if (domain.empty()) {
+      choiceError(port, "choice type for port '%s.%s' must be a direct 'Choice of Domain'",
+                  module->name.c_str(), port->name.c_str());
+    }
+    if (port->type != P_INPUT) {
+      choiceError(port, "choice port '%s.%s' must be an input",
+                  module->name.c_str(), port->name.c_str());
+    }
+    if (choiceDomains.find(domain) == choiceDomains.end()) {
+      choiceError(port, "choice port '%s.%s' references unknown domain '%s'",
+                  module->name.c_str(), port->name.c_str(), domain.c_str());
+    }
+    moduleChoicePorts[module].emplace(port->name, domain);
+  }
+}
+
+static std::string choiceTypeSignature(PNode* typeNode) {
+  if (!typeNode) return "<missing>";
+  switch (typeNode->type) {
+    case P_INT_TYPE:
+      return (typeNode->isProbe ? "probe " : "") + typeNode->name + "<" +
+             std::to_string(typeNode->width) + ">";
+    case P_Clock:
+      return "Clock<1>";
+    case P_RESET:
+      return "Reset<1>";
+    case P_ASYRESET:
+      return "AsyncReset<1>";
+    case P_CHOICE_TYPE:
+      return "Choice<" + typeNode->name + ">";
+    case P_AG_ARRAY:
+      return choiceTypeSignature(typeNode->getChild(0)) + "[" + typeNode->getExtra(0) + "]";
+    case P_AG_FIELDS: {
+      std::string result = "{";
+      for (size_t i = 0; i < typeNode->child.size(); ++i) {
+        PNode* field = typeNode->getChild(i);
+        if (i) result += ",";
+        if (field->type == P_FLIP_FIELD) result += "flip ";
+        result += field->name + ":" + choiceTypeSignature(field->getChild(0));
+      }
+      return result + "}";
+    }
+    default:
+      return "<unsupported-type-" + std::to_string(typeNode->type) + ">";
+  }
+}
+
+static std::vector<std::string> moduleInterface(PNode* module) {
+  std::vector<std::string> result;
+  for (PNode* port : module->getChild(0)->child) {
+    result.push_back((port->type == P_INPUT ? "in " : "out ") +
+                     port->name + ":" + choiceTypeSignature(port->getChild(0)));
+  }
+  return result;
+}
+
+static void validateCandidateInterface(PNode* location, const std::string& defaultName,
+                                       const std::string& alternativeName) {
+  auto defaultIt = moduleMap.find(defaultName);
+  auto alternativeIt = moduleMap.find(alternativeName);
+  if (defaultIt == moduleMap.end()) {
+    choiceError(location, "paraminstchoice default module '%s' is not defined", defaultName.c_str());
+  }
+  if (alternativeIt == moduleMap.end()) {
+    choiceError(location, "paraminstchoice alternative module '%s' is not defined", alternativeName.c_str());
+  }
+  PNode* defaultModule = defaultIt->second;
+  PNode* alternativeModule = alternativeIt->second;
+  if ((defaultModule->type != P_MOD && defaultModule->type != P_EXTMOD) ||
+      (alternativeModule->type != P_MOD && alternativeModule->type != P_EXTMOD)) {
+    choiceError(location, "paraminstchoice candidates must be module or extmodule definitions");
+  }
+  for (PNode* port : defaultModule->getChild(0)->child) {
+    if (hasProbeType(port->getChild(0))) {
+      choiceError(location, "paraminstchoice candidate '%s' has unsupported probe port '%s'",
+                  defaultName.c_str(), port->name.c_str());
+    }
+  }
+  for (PNode* port : alternativeModule->getChild(0)->child) {
+    if (hasProbeType(port->getChild(0))) {
+      choiceError(location, "paraminstchoice candidate '%s' has unsupported probe port '%s'",
+                  alternativeName.c_str(), port->name.c_str());
+    }
+  }
+  if (moduleInterface(defaultModule) != moduleInterface(alternativeModule)) {
+    choiceError(location, "paraminstchoice candidates '%s' and '%s' have incompatible interfaces",
+                defaultName.c_str(), alternativeName.c_str());
+  }
+}
+
+static std::string staticChoiceExprDomain(PNode* expression,
+                                          const std::map<std::string, std::string>& formalPorts) {
+  if (expression->type == P_CHOICE_CONST) {
+    resolveChoiceCase(expression, expression->info, expression->name);
+    return expression->info;
+  }
+  if (expression->type != P_REF || expression->getChildNum() != 0) {
+    choiceError(expression, "unsupported choice expression; expected a choice constant or formal choice input");
+  }
+  auto formalIt = formalPorts.find(expression->name);
+  if (formalIt == formalPorts.end()) {
+    choiceError(expression, "'%s' is not a formal choice input of the containing module",
+                expression->name.c_str());
+  }
+  return formalIt->second;
+}
+
+static void collectModuleChoiceMetadata(PNode* node, bool direct,
+                                        InstanceModuleMap& instances,
+                                        std::vector<PNode*>& choiceStatements) {
+  if (!node) return;
+  switch (node->type) {
+    case P_INST: {
+      const std::string& target = node->getExtra(0);
+      if (moduleMap.find(target) == moduleMap.end()) {
+        choiceError(node, "module '%s' is not defined", target.c_str());
+      }
+      if (!instances.emplace(node->name, target).second) {
+        choiceError(node, "duplicate instance '%s'", node->name.c_str());
+      }
+      return;
+    }
+    case P_PROP_ASSIGN:
+      if (!direct) {
+        choiceError(node, "conditional or nested propassign is not supported");
+      }
+      choiceStatements.push_back(node);
+      return;
+    case P_PARAM_INST_CHOICE:
+      if (!instances.emplace(node->name, node->getExtra(0)).second) {
+        choiceError(node, "duplicate instance '%s'", node->name.c_str());
+      }
+      choiceStatements.push_back(node);
+      return;
+    case P_CHOICE_DOMAIN:
+    case P_CHOICE_CASE:
+    case P_CHOICE_ARM:
+      return;
+    default:
+      break;
+  }
+  for (PNode* childNode : node->child) {
+    collectModuleChoiceMetadata(childNode, false, instances, choiceStatements);
+  }
+}
+
+static void rejectChoicePortHardwareUse(PNode* node,
+                                        const std::map<std::string, std::string>& formalPorts) {
+  if (!node) return;
+  if (node->type == P_PROP_ASSIGN || node->type == P_PARAM_INST_CHOICE) return;
+  if (node->type == P_REF && node->getChildNum() == 0 &&
+      formalPorts.find(node->name) != formalPorts.end()) {
+    choiceError(node, "choice input '%s' cannot be used as a hardware value",
+                node->name.c_str());
+  }
+  for (PNode* childNode : node->child) rejectChoicePortHardwareUse(childNode, formalPorts);
+}
+
+static void validateParamInstChoice(PNode* paramChoice,
+                                    const std::map<std::string, std::string>& formalPorts) {
+  Assert(paramChoice->getExtraNum() == 1,
+         "paraminstchoice %s has no default module", paramChoice->name.c_str());
+  const std::string& defaultModule = paramChoice->getExtra(0);
+  if (moduleMap.find(defaultModule) == moduleMap.end()) {
+    choiceError(paramChoice, "paraminstchoice '%s' default module '%s' is not defined",
+                paramChoice->name.c_str(), defaultModule.c_str());
+  }
+  std::string selectorDomain = staticChoiceExprDomain(paramChoice->getChild(0), formalPorts);
+  std::set<std::string> alternativeCases;
+  for (size_t i = 1; i < paramChoice->child.size(); ++i) {
+    PNode* arm = paramChoice->getChild(i);
+    if (arm->type != P_CHOICE_ARM || arm->getExtraNum() != 1) {
+      choiceError(arm, "malformed paraminstchoice arm in '%s'", paramChoice->name.c_str());
+    }
+    if (!alternativeCases.insert(arm->name).second) {
+      choiceError(arm, "duplicate case '%s' in paraminstchoice '%s'",
+                  arm->name.c_str(), paramChoice->name.c_str());
+    }
+    ChoiceValue alternative = resolveChoiceCase(arm, selectorDomain, arm->name);
+    (void)alternative;
+    validateCandidateInterface(arm, defaultModule, arm->getExtra(0));
+  }
+}
+
+static void validatePropAssign(PNode* assignment,
+                               const std::map<std::string, std::string>& formalPorts,
+                               const InstanceModuleMap& instances,
+                               std::map<std::string, std::set<std::string>>& assignedPorts) {
+  PNode* destination = assignment->getChild(0);
+  PNode* source = assignment->getChild(1);
+  if (destination->type != P_REF || destination->getChildNum() != 1 ||
+      destination->getChild(0)->type != P_REF_DOT ||
+      destination->getChild(0)->getChildNum() != 0) {
+    choiceError(assignment, "propassign destination must be <instance>.<choice-port>");
+  }
+  const std::string& instanceName = destination->name;
+  const std::string& portName = destination->getChild(0)->name;
+  auto instanceIt = instances.find(instanceName);
+  if (instanceIt == instances.end()) {
+    choiceError(assignment, "propassign targets unknown instance '%s'", instanceName.c_str());
+  }
+  PNode* targetModule = moduleMap[instanceIt->second];
+  auto targetPortsIt = moduleChoicePorts.find(targetModule);
+  if (targetPortsIt == moduleChoicePorts.end() ||
+      targetPortsIt->second.find(portName) == targetPortsIt->second.end()) {
+    choiceError(assignment, "propassign target '%s.%s' is not a choice input",
+                instanceName.c_str(), portName.c_str());
+  }
+  std::string sourceDomain = staticChoiceExprDomain(source, formalPorts);
+  const std::string& targetDomain = targetPortsIt->second.at(portName);
+  if (sourceDomain != targetDomain) {
+    choiceError(assignment, "propassign domain mismatch for '%s.%s': got '%s', expected '%s'",
+                instanceName.c_str(), portName.c_str(), sourceDomain.c_str(),
+                targetDomain.c_str());
+  }
+  if (!assignedPorts[instanceName].insert(portName).second) {
+    choiceError(assignment, "multiple propassigns target '%s.%s'",
+                instanceName.c_str(), portName.c_str());
+  }
+}
+
+static void validateModuleChoiceStatements(PNode* module) {
+  const auto& formalPorts = moduleChoicePorts[module];
+  InstanceModuleMap instances;
+  std::vector<PNode*> choiceStatements;
+  for (PNode* statement : module->getChild(1)->child) {
+    rejectChoicePortHardwareUse(statement, formalPorts);
+    if (containsPNodeType(statement, P_CHOICE_TYPE)) {
+      choiceError(statement, "choice types are only supported on module input ports");
+    }
+    collectModuleChoiceMetadata(statement, true, instances, choiceStatements);
+  }
+
+  std::map<std::string, std::set<std::string>> assignedPorts;
+  for (PNode* statement : choiceStatements) {
+    if (statement->type == P_PARAM_INST_CHOICE) {
+      validateParamInstChoice(statement, formalPorts);
+    } else {
+      validatePropAssign(statement, formalPorts, instances, assignedPorts);
+    }
+  }
+
+  for (const auto& instance : instances) {
+    PNode* targetModule = moduleMap[instance.second];
+    auto targetPortsIt = moduleChoicePorts.find(targetModule);
+    if (targetPortsIt == moduleChoicePorts.end()) continue;
+    for (const auto& formalPort : targetPortsIt->second) {
+      if (assignedPorts[instance.first].find(formalPort.first) == assignedPorts[instance.first].end()) {
+        choiceError(targetModule, "instance '%s' of module '%s' is missing propassign for choice port '%s'",
+                    instance.first.c_str(), instance.second.c_str(), formalPort.first.c_str());
+      }
+    }
+  }
+}
 
 static inline void typeCheck(PNode* node, const int expect[], int size, int minChildNum, int maxChildNum) {
   const int* expectEnd = expect + size;
@@ -115,6 +521,113 @@ static inline void prefix_pop() {
 static inline std::string replacePrefix(std::string oldPrefix, std::string newPrefix, std::string str) {
   Assert(str.compare(0, oldPrefix.length(), oldPrefix) == 0, "member name %s does not start with %s", str.c_str(), oldPrefix.c_str());
   return newPrefix + str.substr(oldPrefix.length());
+}
+
+static ChoiceValue resolveChoiceExprRuntime(PNode* expression, const ChoiceEnv& env) {
+  if (expression->type == P_CHOICE_CONST) {
+    return resolveChoiceCase(expression, expression->info, expression->name);
+  }
+  if (expression->type != P_REF || expression->getChildNum() != 0) {
+    choiceError(expression, "unsupported choice expression; expected a choice constant or formal choice input");
+  }
+  auto valueIt = env.find(expression->name);
+  if (valueIt == env.end()) {
+    choiceError(expression, "choice input '%s' has no actual value",
+                expression->name.c_str());
+  }
+  return valueIt->second;
+}
+
+static InstanceChoiceEnv indexChoiceAssignments(PNode* statements, const ChoiceEnv& env) {
+  InstanceChoiceEnv result;
+  for (PNode* statement : statements->child) {
+    if (statement->type != P_PROP_ASSIGN) continue;
+    PNode* destination = statement->getChild(0);
+    const std::string& instanceName = destination->name;
+    const std::string& portName = destination->getChild(0)->name;
+    result[instanceName][portName] = resolveChoiceExprRuntime(statement->getChild(1), env);
+  }
+  return result;
+}
+
+static ChoiceEnv resolveTopChoiceEnv(PNode* topModule) {
+  ChoiceEnv env;
+  const auto& formalPorts = moduleChoicePorts[topModule];
+  for (const auto& binding : globalConfig.ElabChoices) {
+    if (formalPorts.find(binding.first) == formalPorts.end()) {
+      choiceError(topModule, "--elab-choice names unknown top-level choice port '%s'",
+                  binding.first.c_str());
+    }
+  }
+  for (const auto& formalPort : formalPorts) {
+    auto bindingIt = globalConfig.ElabChoices.find(formalPort.first);
+    if (bindingIt == globalConfig.ElabChoices.end()) {
+      choiceError(topModule, "top-level choice port '%s' of domain '%s' is unbound; pass --elab-choice=%s=<case-or-encoding>",
+                  formalPort.first.c_str(), formalPort.second.c_str(), formalPort.first.c_str());
+    }
+    ChoiceDomain& domain = choiceDomains.at(formalPort.second);
+    const std::string& binding = bindingIt->second;
+    auto caseIt = domain.encodings.find(binding);
+    if (caseIt != domain.encodings.end()) {
+      env[formalPort.first] = ChoiceValue{formalPort.second, caseIt->second};
+      continue;
+    }
+    if (binding.empty() || binding[0] == '-') {
+      choiceError(topModule, "invalid --elab-choice value '%s' for port '%s'",
+                  binding.c_str(), formalPort.first.c_str());
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long encoding = std::strtoull(binding.c_str(), &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' ||
+        !choiceEncodingFits(domain.width, static_cast<uint64_t>(encoding))) {
+      choiceError(topModule, "unknown case or out-of-range encoding '%s' for top-level choice port '%s' (domain '%s')",
+                  binding.c_str(), formalPort.first.c_str(), formalPort.second.c_str());
+    }
+    env[formalPort.first] = ChoiceValue{formalPort.second, static_cast<uint64_t>(encoding)};
+  }
+  return env;
+}
+
+static void validateChoiceActuals(PNode* location, PNode* module, const ChoiceEnv& env) {
+  const auto& formalPorts = moduleChoicePorts[module];
+  for (const auto& formalPort : formalPorts) {
+    auto actualIt = env.find(formalPort.first);
+    if (actualIt == env.end()) {
+      choiceError(location, "instance '%s' is missing an actual for choice port '%s'",
+                  location->name.c_str(), formalPort.first.c_str());
+    }
+    if (actualIt->second.domain != formalPort.second) {
+      choiceError(location, "choice actual for '%s' has domain '%s', expected '%s'",
+                  formalPort.first.c_str(), actualIt->second.domain.c_str(),
+                  formalPort.second.c_str());
+    }
+  }
+  for (const auto& actual : env) {
+    if (formalPorts.find(actual.first) == formalPorts.end()) {
+      choiceError(location, "choice actual '%s' does not match a formal input", actual.first.c_str());
+    }
+  }
+}
+
+static ChoiceEnv collectInstanceChoiceActuals(PNode* instance, PNode* targetModule) {
+  ChoiceEnv actuals;
+  const InstanceChoiceEnv& indexed = instanceChoiceEnvStack.top();
+  auto actualIt = indexed.find(instance->name);
+  if (actualIt != indexed.end()) actuals = actualIt->second;
+  validateChoiceActuals(instance, targetModule, actuals);
+  return actuals;
+}
+
+static PNode* resolveParamInstChoiceTarget(PNode* paramChoice) {
+  ChoiceValue selector = resolveChoiceExprRuntime(paramChoice->getChild(0), choiceEnvStack.top());
+  const std::string& defaultModule = paramChoice->getExtra(0);
+  for (size_t i = 1; i < paramChoice->child.size(); ++i) {
+    PNode* arm = paramChoice->getChild(i);
+    ChoiceValue alternative = resolveChoiceCase(arm, selector.domain, arm->name);
+    if (alternative.encoding == selector.encoding) return moduleMap.at(arm->getExtra(0));
+  }
+  return moduleMap.at(defaultModule);
 }
 /* return the trailing string of the last $ */
 static inline std::string lastField(std::string s) {
@@ -263,6 +776,7 @@ void visitTopPorts(graph* g, PNode* ports) {
   // visit all ports
   for (int i = 0; i < ports->getChildNum(); i ++) {
     PNode* port = ports->getChild(i);
+    if (hasChoiceType(port->getChild(0))) continue;
     TypeInfo* info = visitPort(g, port, P_CIRCUIT);
     for (auto entry : info->aggrMember) {
       Node* node = entry.first;
@@ -498,12 +1012,17 @@ ASTExpTree* visitExpr(graph* g, PNode* expr) {
 /*
 module: Module ALLID ':' info INDENT ports statements DEDENT { $$ = newNode(P_MOD, synlineno(), $4, $2, 2, $6, $7); }
 */
-void visitModule(graph* g, PNode* module) {
+void visitModule(graph* g, PNode* module, const ChoiceEnv& env) {
   TYPE_CHECK(module, 2, 2, P_MOD);
   // printf("visit module %s\n", module->name.c_str());
 
+  validateChoiceActuals(module, module, env);
+  choiceEnvStack.push(env);
+  instanceChoiceEnvStack.push(indexChoiceAssignments(module->getChild(1), env));
+
   PNode* ports = module->getChild(0);
   for (int i = 0; i < ports->getChildNum(); i ++) {
+    if (hasChoiceType(ports->getChild(i)->getChild(0))) continue;
     TypeInfo* portInfo = visitPort(g, ports->getChild(i), P_MOD);
 
     for (auto entry : portInfo->aggrMember) {
@@ -516,13 +1035,17 @@ void visitModule(graph* g, PNode* module) {
   }
 
   visitStmts(g, module->getChild(1));
+  instanceChoiceEnvStack.pop();
+  choiceEnvStack.pop();
   // printf("leave module %s\n", module->name.c_str());
 }
 /*
 extmodule: Extmodule ALLID ':' info INDENT ports ext_defname params DEDENT  { $$ = newNode(P_EXTMOD, synlineno(), $4, $2, 1, $6); $$->appendChildList($8);}
 */
-void visitExtModule(graph* g, PNode* module) {
+void visitExtModule(graph* g, PNode* module, const ChoiceEnv& env) {
   TYPE_CHECK(module, 2, 2, P_EXTMOD);
+
+  validateChoiceActuals(module, module, env);
 
   if (module->getExtra(0) == CLOCK_GATE_NAME) { // ClockGate
     PNode* ports = module->getChild(0);
@@ -554,6 +1077,7 @@ void visitExtModule(graph* g, PNode* module) {
     addSignal(extNode->name, extNode);
     PNode* ports = module->getChild(0);
     for (int i = 0; i < ports->getChildNum(); i ++) {
+      if (hasChoiceType(ports->getChild(i)->getChild(0))) continue;
       TypeInfo* portInfo = visitPort(g, ports->getChild(i), P_EXTMOD);
       for (auto entry : portInfo->aggrMember) {
         if (entry.first->isClock) {
@@ -823,14 +1347,31 @@ void visitInst(graph* g, PNode* inst) {
   Assert(inst->getExtraNum() >= 1 && moduleMap.find(inst->getExtra(0)) != moduleMap.end(),
                "Module %s is not defined!\n", inst->getExtra(0).c_str());
   PNode* module = moduleMap[inst->getExtra(0)];
+  ChoiceEnv actuals = collectInstanceChoiceActuals(inst, module);
   prefix_append(SEP_MODULE, inst->name);
   moduleInstances.insert(topPrefix());
   switch(module->type) {
-    case P_MOD: visitModule(g, module); break;
-    case P_EXTMOD: visitExtModule(g, module); break;
+    case P_MOD: visitModule(g, module, actuals); break;
+    case P_EXTMOD: visitExtModule(g, module, actuals); break;
     case P_INTMOD: TODO();
     default:
       Panic();
+  }
+  prefix_pop();
+}
+
+void visitParamInstChoice(graph* g, PNode* paramChoice) {
+  TYPE_CHECK(paramChoice, 1, INT32_MAX, P_PARAM_INST_CHOICE);
+  PNode* module = resolveParamInstChoiceTarget(paramChoice);
+  ChoiceEnv actuals = collectInstanceChoiceActuals(paramChoice, module);
+  prefix_append(SEP_MODULE, paramChoice->name);
+  moduleInstances.insert(topPrefix());
+  switch (module->type) {
+    case P_MOD: visitModule(g, module, actuals); break;
+    case P_EXTMOD: visitExtModule(g, module, actuals); break;
+    default:
+      choiceError(paramChoice, "paraminstchoice target '%s' is not an internal or external module",
+                  module->name.c_str());
   }
   prefix_pop();
 }
@@ -1287,6 +1828,8 @@ void visitWhenStmt(graph* g, PNode* stmt) {
     case P_ASSERT: visitWhenAssert(g, stmt); break;
     case P_STOP: visitWhenStop(g, stmt); break;
     case P_INST: visitInst(g, stmt); break;
+    case P_PARAM_INST_CHOICE: visitParamInstChoice(g, stmt); break;
+    case P_PROP_ASSIGN: break;
     case P_REG_DEF: visitRegDef(g, stmt, P_REG_DEF); break;
     case P_REG_RESET_DEF: visitRegDef(g, stmt, P_REG_RESET_DEF); break;
     case P_READ :
@@ -1440,6 +1983,8 @@ void visitStmt(graph* g, PNode* stmt) {
     case P_REG_DEF: visitRegDef(g, stmt, P_REG_DEF); break;
     case P_REG_RESET_DEF: visitRegDef(g, stmt, P_REG_RESET_DEF); break;
     case P_INST: visitInst(g, stmt); break;
+    case P_PARAM_INST_CHOICE: visitParamInstChoice(g, stmt); break;
+    case P_PROP_ASSIGN: break;
     case P_SEQ_MEMORY : visitChirrtlMemory(g, stmt); break;
     case P_COMB_MEMORY: visitChirrtlMemory(g, stmt); break;
     case P_READ:
@@ -1479,8 +2024,13 @@ void visitStmts(graph* g, PNode* stmts) {
 */
 void visitTopModule(graph* g, PNode* topModule) {
   TYPE_CHECK(topModule, 2, 2, P_MOD);
+  ChoiceEnv topEnv = resolveTopChoiceEnv(topModule);
+  choiceEnvStack.push(topEnv);
+  instanceChoiceEnvStack.push(indexChoiceAssignments(topModule->getChild(1), topEnv));
   visitTopPorts(g, topModule->getChild(0));
   visitStmts(g, topModule->getChild(1));
+  instanceChoiceEnvStack.pop();
+  choiceEnvStack.pop();
 }
 
 void updatePrevNext(Node* n) {
@@ -1556,12 +2106,26 @@ graph* AST2Graph(PNode* root) {
 
   PNode* topModule = NULL;
 
+  validateChoiceDomains(root);
   for (int i = 0; i < root->getChildNum(); i++) {
     PNode* module = root->getChild(i);
+    if (module->type != P_MOD && module->type != P_EXTMOD) continue;
     if (module->name == root->name) { topModule = module; }
-    moduleMap[module->name] = module;
+    if (!moduleMap.emplace(module->name, module).second) {
+      choiceError(module, "duplicate module definition '%s'", module->name.c_str());
+    }
   }
   Assert(topModule, "Top module can not be NULL\n");
+  for (int i = 0; i < root->getChildNum(); i++) {
+    PNode* module = root->getChild(i);
+    if (module->type == P_MOD || module->type == P_EXTMOD) {
+      validateModuleChoicePorts(module);
+    }
+  }
+  for (int i = 0; i < root->getChildNum(); i++) {
+    PNode* module = root->getChild(i);
+    if (module->type == P_MOD) validateModuleChoiceStatements(module);
+  }
   visitTopModule(g, topModule);
 
 /* infer memory port (NODE_INFER) */

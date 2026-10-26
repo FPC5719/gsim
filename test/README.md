@@ -3,6 +3,8 @@
 - Any `*.fir` file in this directory is auto-discovered by `make fir-tests` and by the GitHub CI `fir-regression` job.
 - A same-name `*.cpp` file is compiled with the generated model and run under
   AddressSanitizer and UndefinedBehaviorSanitizer.
+- A same-name `*.flags` file supplies extra GSIM command-line options for that
+  test case.
 - array-narrowing.fir: Checks element-width truncation on two-dimensional
   register row connects, plus unsigned and signed whole-array narrowing and
   extension across native C++ storage widths.
@@ -27,3 +29,18 @@
   and padding applied to negative signed constants.
 - signed-runtime-slice.fir: Checks that a full-width signed bit selection becomes
   unsigned without host sign-extension bits when concatenated with other bits.
+- paraminstchoice-hierarchy.fir: Checks per-instance specialization of a shared
+  module with different elaboration-time choice actuals.
+- paraminstchoice-forwarding.fir: Checks choice forwarding through two wrapper
+  modules before the parameterized instance choice.
+- paraminstchoice-extmodule.fir: Checks that only the selected external
+  candidate is emitted and receives its parameter list.
+- paraminstchoice-literal-selector.fir: Checks folding of a literal
+  `choice(Domain, Case)` selector.
+- paraminstchoice-nested.fir: Checks structural selection of a
+  `paraminstchoice` declared inside a `when` block.
+- paraminstchoice-top-binding.fir: Checks a top-level choice supplied through
+  the per-test `paraminstchoice-top-binding.flags` file.
+
+Negative coverage for diagnostics and version gating is under
+`test/paraminstchoice/errors/`.

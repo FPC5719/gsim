@@ -136,6 +136,7 @@ static void printUsage(const char* ProgName) {
             << "      --log-level=[0|1|2]          Verbosity for additional logs.\n"
             << "      --threads=[num]              Number of worker threads used to parse the input\n"
             << "                                   (default: 10, held down to the available CPUs).\n"
+            << "      --elab-choice=<port>=<case>  Bind a top-level choice parameter (repeatable).\n"
             << "      --dump-json                  Dump graphs in JSON (disable dot unless --dump-dot is also set).\n"
             << "      --dump-dot                   Dump graphs in DOT (disable json unless --dump-json is also set).\n"
             << "      --dump-stages=a,b,c          Dump only the listed stages (e.g., Init,TopoSort,AliasAnalysis).\n"
@@ -165,6 +166,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_WHEN2MUX,
     OPT_LOG_LEVEL,
     OPT_THREADS,
+    OPT_ELAB_CHOICE,
     OPT_DUMP_JSON,
     OPT_DUMP_DOT,
     OPT_DUMP_STAGES,
@@ -185,6 +187,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"when2mux-bound", required_argument, nullptr, 0},
       {"log-level", required_argument, nullptr, 0},
       {"threads", required_argument, nullptr, 0},
+      {"elab-choice", required_argument, nullptr, 0},
       {"dump-json", no_argument, nullptr, 0},
       {"dump-dot", no_argument, nullptr, 0},
       {"dump-stages", required_argument, nullptr, 0},
@@ -228,6 +231,24 @@ static char* parseCommandLine(int argc, char** argv) {
                   if (globalConfig.NumThreads != requested) {
                     fprintf(stderr, "Warning: --threads=%d exceeds the %d CPUs available here, using %d.\n",
                         requested, globalConfig.NumThreads, globalConfig.NumThreads);
+                  }
+                  break;
+                }
+                case OPT_ELAB_CHOICE: {
+                  const char* equals = strchr(optarg, '=');
+                  if (!equals || equals == optarg || equals[1] == '\0') {
+                    fprintf(stderr, "Error: --elab-choice expects <port>=<case-or-encoding>, got '%s'.\n", optarg);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  std::string port(optarg, equals - optarg);
+                  std::string value(equals + 1);
+                  if (!globalConfig.ElabChoices.emplace(port, value).second) {
+                    fprintf(stderr, "Error: duplicate --elab-choice binding for '%s'.\n", port.c_str());
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
                   }
                   break;
                 }

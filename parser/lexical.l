@@ -95,6 +95,13 @@ info        [0-9A-Za-z.{}:,/ _-]+
 <normal>SInt                    { yylval->typeGround = "SInt";       return token::IntType; }
 <normal>Probe                   { yylval->typeGround = "Probe";      return token::ProbeType; }
 <normal>probe                   { yylval->typeGround = "probe";      return token::Probe; }
+<normal>Choice                  { requireChoiceFeature("choice type syntax"); return token::ChoiceKeyword; }
+<normal>choice                   { requireChoiceFeature("choice constant syntax"); return token::ChoiceKeyword; }
+<normal>choice_domain           { requireChoiceFeature("choice domain syntax"); return token::ChoiceDomain; }
+<normal>choice_case             { requireChoiceFeature("choice case syntax"); return token::ChoiceCase; }
+<normal>propassign              { requireChoiceFeature("propassign syntax"); return token::PropAssign; }
+<normal>paraminstchoice         { requireChoiceFeature("paraminstchoice syntax"); return token::ParamInstChoice; }
+<normal>width                   { return token::Width; }
 <normal>Analog                  { yylval->typeGround = "Analog";     return token::anaType; }
 <normal>Fixed                   { yylval->typeGround = "Fixed";      return token::FixedType; }
 <normal>flip                    { return token::Flip;}

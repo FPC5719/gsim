@@ -235,10 +235,10 @@ compile: $(GEN_CPP_DIR)/$(NAME)0.cpp
 .PHONY: compile
 
 .SECONDEXPANSION:
-$(FIR_TEST_OUTPUT_DIR)/%/.done: $(FIR_TEST_INPUT_DIR)/%.fir $(GSIM_BIN) $$(wildcard $$(FIR_TEST_INPUT_DIR)/$$*.cpp)
+$(FIR_TEST_OUTPUT_DIR)/%/.done: $(FIR_TEST_INPUT_DIR)/%.fir $(GSIM_BIN) $$(wildcard $$(FIR_TEST_INPUT_DIR)/$$*.cpp) $$(wildcard $$(FIR_TEST_INPUT_DIR)/$$*.flags)
 	@mkdir -p $(@D)
 	set -o pipefail && $(TIME) $(FIR_TEST_TIMEOUT_PREFIX) $(GSIM_BIN) --dir $(@D) \
-		$(GSIM_FLAGS_EXTRA) $< | tee $(@D)/gsim.log
+		$(GSIM_FLAGS_EXTRA) $$(cat $(FIR_TEST_INPUT_DIR)/$*.flags 2>/dev/null) $< | tee $(@D)/gsim.log
 	@if [[ -f "$(FIR_TEST_INPUT_DIR)/$*.cpp" ]]; then \
 		set -e; \
 		echo "+ CXX/RUN $*"; \

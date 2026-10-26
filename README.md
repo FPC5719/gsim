@@ -25,6 +25,17 @@ GSIM accepts chirrtl, and compiles it to C++
 + Refer to `build/gsim/gsim --help` for more information
 + See [C++ harness example](https://github.com/jaypiper/simulator/blob/master/emu/emu.cpp) to know how it interacts with the emitted C++ code.
 
+### FIRRTL 7 choice parameters
+
+GSIM supports FIRRTL 7 choice domains, choice input ports, `propassign`,
+`choice(Domain, Case)`, and `paraminstchoice`. Selection is resolved during
+graph elaboration, so only the selected internal or external module is
+instantiated and choice ports do not appear in generated C++ interfaces.
+Unbound top-level choices are fixed with repeatable options such as
+`--elab-choice=impl=Fast` or `--elab-choice=impl=1`. See
+[the FIRRTL 7 choice support note](docs/firrtl-7-choices.md) for syntax,
+validation rules, and V1 limitations.
+
 ## Debug logs & dumps
 
 + By default `gsim` runs quietly (`LogLevel=0`, dump disabled). Enable lightweight stage logs with `--log-level=1` (prints pass begin/end). Use `--log-level=2` for verbose constant-analysis traces; expect a lot more stderr.

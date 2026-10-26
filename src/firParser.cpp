@@ -20,6 +20,26 @@ static std::condition_variable cv;
 static PList **lists;
 static PNode *globalRoot;
 
+static Parser::SemanticVersion findFirrtlVersion(char* strbuf) {
+  Parser::SemanticVersion version;
+  const char* marker = "FIRRTL version ";
+  for (const char* line = strbuf; line && *line; line = strchr(line, '\n')) {
+    if (*line == '\n') ++line;
+    const char* header = line;
+    while (*header == ' ' || *header == '\t') ++header;
+    if (strncmp(header, marker, strlen(marker)) != 0) continue;
+    header += strlen(marker);
+    unsigned major, minor, patch;
+    if (sscanf(header, "%u.%u.%u", &major, &minor, &patch) == 3) {
+      version.major = major;
+      version.minor = minor;
+      version.patch = patch;
+    }
+    break;
+  }
+  return version;
+}
+
 static const char* moduleHeaderKeywords[] = {
   "module ",
   "public module ",
@@ -60,7 +80,7 @@ static char* findNextModuleMarker(char* start) {
   }
 }
 
-void parseFunc(char *strbuf, int tid) {
+void parseFunc(char *strbuf, int tid, Parser::SemanticVersion version) {
   while (true) {
     std::unique_lock lk(m);
     cv.wait(lk, []{ return !taskQueue->empty(); });
@@ -74,7 +94,7 @@ void parseFunc(char *strbuf, int tid) {
     //for (int i = 0; i < 100; i ++) { putchar(strbuf[e.offset + i]); } putchar('\n');
 
     std::istringstream *streamBuf = new std::istringstream(strbuf + e.offset);
-    Parser::Lexical *lexical = new Parser::Lexical(*streamBuf, std::cout);
+    Parser::Lexical *lexical = new Parser::Lexical(*streamBuf, std::cout, version);
     Parser::Syntax *syntax = new Parser::Syntax(lexical);
     lexical->set_lineno(e.lineno);
     syntax->parse();
@@ -92,6 +112,7 @@ void parseFunc(char *strbuf, int tid) {
 }
 
 PNode* parseFIR(char *strbuf) {
+  Parser::SemanticVersion version = findFirrtlVersion(strbuf);
   taskQueue = new std::vector<TaskRecord>;
   const int nrThread = globalConfig.NumThreads;
   std::future<void> *threads = new std::future<void> [nrThread];
@@ -147,7 +168,7 @@ PNode* parseFIR(char *strbuf) {
 
   // create threads
   for (int i = 0; i < nrThread; i ++) {
-    threads[i] = async(std::launch::async, parseFunc, strbuf, i);
+    threads[i] = async(std::launch::async, parseFunc, strbuf, i, version);
   }
 
   for (int i = 0; i < nrThread; i ++) {

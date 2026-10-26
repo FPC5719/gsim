@@ -17,6 +17,7 @@ struct Config {
   int LogLevel;
   int NumThreads;
   std::set<std::string> DumpStages;
+  std::map<std::string, std::string> ElabChoices;
   Config();
 };
 

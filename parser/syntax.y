@@ -80,7 +80,7 @@ static char* emptyStr = NULL;
 %token RightArrow "=>"
 %token Leftarrow "<-"
 %token DataType Depth ReadLatency WriteLatency ReadUnderwrite Reader Writer Readwriter Write Read Infer Rdwr Mport
-%token Layer Layerblock
+%token Layer Layerblock ChoiceKeyword ChoiceDomain ChoiceCase PropAssign ParamInstChoice Width
 %token Cat
 /* internal node */
 %type <intVal> width
@@ -89,6 +89,7 @@ static char* emptyStr = NULL;
 %type <pnode> chirrtl_memory chirrtl_memory_datatype chirrtl_memory_port
 %type <pnode> reference expr primop_2expr primop_1expr primop_1expr1int primop_1expr2int
 %type <pnode> field type_aggregate type_ground circuit
+%type <pnode> choice_domain choice_case choice_cases choice_arm choice_arms property_expr
 %type <strVal> info ALLID ext_defname intrinsic_params intrinsic_param_list intrinsic_param
 /* %token <pnode> */
 
@@ -98,7 +99,7 @@ static char* emptyStr = NULL;
 
 %%
 /* remove version */
-circuit: version Circuit ALLID ':' annotations info INDENT cir_mods DEDENT { scanner->root = newNode(P_CIRCUIT, synlineno(), $6, $3); scanner->list = $8; (void)yynerrs_;}
+circuit: version Circuit ALLID ':' annotations info INDENT cir_mods DEDENT { scanner->root = newNode(P_CIRCUIT, synlineno(), $6, $3); scanner->root->appendExtraInfo(scanner->version.str().c_str()); scanner->list = $8; (void)yynerrs_;}
   | INDENT cir_mods DEDENT { scanner->list = $2; }
   ;
 ALLID: ID {$$ = $1; }
@@ -124,6 +125,12 @@ ALLID: ID {$$ = $1; }
     | Module { $$ = "module"; }
     | Const { $$ = "const"; }
     | Layer { $$ = "layer"; }
+    | Width { $$ = "width"; }
+    | ChoiceKeyword { $$ = "choice"; }
+    | ChoiceDomain { $$ = "choice_domain"; }
+    | ChoiceCase { $$ = "choice_case"; }
+    | PropAssign { $$ = "propassign"; }
+    | ParamInstChoice { $$ = "paraminstchoice"; }
     ;
 /* Fileinfo communicates Chisel source file and line/column info */
 /* linecol: INT ':' INT    { $$ = malloc(strlen($1) + strlen($2) + 2); strcpy($$, $1); str$1 + ":" + $3}
@@ -142,9 +149,10 @@ type_ground: Clock              { $$ = new PNode(P_Clock, synlineno()); }
     | Reset                     { $$ = new PNode(P_RESET, synlineno()); $$->setWidth(1); $$->setSign(0);}
     | AsyReset                  { $$ = new PNode(P_ASYRESET, synlineno()); $$->setWidth(1); $$->setSign(0);}
     | IntType width             { $$ = newNode(P_INT_TYPE, synlineno(), $1, 0); $$->setWidth($2); $$->setSign($1[0] == 'S'); }
-    | ProbeType '<' IntType '>' { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth(-1); $$->setSign($3[0] == 'S'); }
-    | ProbeType '<' IntType width '>' { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth($4); $$->setSign($3[0] == 'S'); }
-    | ProbeType '<' IntType '<' INT ">>" { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth(p_stoi($5)); $$->setSign($3[0] == 'S'); }
+    | ProbeType '<' IntType '>' { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth(-1); $$->setSign($3[0] == 'S'); $$->isProbe = true; }
+    | ProbeType '<' IntType width '>' { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth($4); $$->setSign($3[0] == 'S'); $$->isProbe = true; }
+    | ProbeType '<' IntType '<' INT ">>" { $$ = newNode(P_INT_TYPE, synlineno(), $3, 0); $$->setWidth(p_stoi($5)); $$->setSign($3[0] == 'S'); $$->isProbe = true; }
+    | ChoiceKeyword Of ALLID { $$ = newNode(P_CHOICE_TYPE, synlineno(), $3, 0); }
     | anaType width             { TODO(); }
     | FixedType width binary_point  { TODO(); }
     ;
@@ -206,6 +214,9 @@ expr: IntType width '(' ')'     { $$ = newNode(P_EXPR_INT_NOINIT, synlineno(), $
           }
           $$ = node;
       }
+    ;
+property_expr: reference { $$ = $1; }
+    | ChoiceKeyword '(' ALLID ',' ALLID ')' { $$ = newNode(P_CHOICE_CONST, synlineno(), $3, $5, 0); }
     ;
 reference: ALLID  { $$ = newNode(P_REF, synlineno(), $1, 0); }
     | reference '.' ALLID  { $$ = $1; $1->appendChild(newNode(P_REF_DOT, synlineno(), $3, 0)); }
@@ -271,6 +282,12 @@ statement: Wire ALLID ':' type info    { $$ = newNode(P_WIRE_DEF, $4->lineno, $5
     | chirrtl_memory_port { $$ = $1; }
     | Inst ALLID Of ALLID info    { $$ = newNode(P_INST, synlineno(), $5, $2, 0); $$->appendExtraInfo($4); }
     | Node ALLID '=' expr info { $$ = newNode(P_NODE, synlineno(), $5, $2, 1, $4); }
+    | PropAssign reference ',' property_expr info { $$ = newNode(P_PROP_ASSIGN, synlineno(), $5, NULL, 2, $2, $4); }
+    | ParamInstChoice ALLID property_expr Of ALLID ':' info INDENT choice_arms DEDENT {
+          $$ = newNode(P_PARAM_INST_CHOICE, synlineno(), $7, $2, 1, $3);
+          $$->appendExtraInfo($5);
+          for (PNode* arm : $9->child) $$->appendChild(arm);
+      }
     | Connect reference ',' expr info { $$ = newNode(P_CONNECT, $2->lineno, $5, NULL, 2, $2, $4); }
     | Connect reference ',' Read '(' expr ')' info { $$ = newNode(P_CONNECT, $2->lineno, $8, NULL, 2, $2, $6); }
     | reference "<-" expr info  { $$ = newNode(P_PAR_CONNECT, $1->lineno, $4, NULL, 2, $1, $3); }
@@ -300,6 +317,22 @@ statement: Wire ALLID ':' type info    { $$ = newNode(P_WIRE_DEF, $4->lineno, $5
       }
     | layerblock_stmt { $$ = $1; }
     | Skip info { $$ = NULL; }
+    ;
+choice_arm: ALLID RightArrow ALLID info { $$ = newNode(P_CHOICE_ARM, synlineno(), $4, $1, 0); $$->appendExtraInfo($3); }
+    ;
+choice_arms: choice_arm { $$ = new PNode(P_EMPTY); $$->appendChild($1); }
+    | choice_arms choice_arm { $$ = $1; $$->appendChild($2); }
+    ;
+choice_case: ChoiceCase ALLID '=' INT info { $$ = newNode(P_CHOICE_CASE, synlineno(), $5, $2, 0); $$->appendExtraInfo($4); }
+    ;
+choice_cases: choice_case { $$ = new PNode(P_EMPTY); $$->appendChild($1); }
+    | choice_cases choice_case { $$ = $1; $$->appendChild($2); }
+    ;
+choice_domain: ChoiceDomain ALLID Width INT ':' info INDENT choice_cases DEDENT {
+        $$ = newNode(P_CHOICE_DOMAIN, synlineno(), $6, $2, 0);
+        $$->setWidth(p_stoi($4));
+        for (PNode* choiceCase : $8->child) $$->appendChild(choiceCase);
+    }
     ;
 /* module definitions */
 port: Input ALLID ':' type info    { $$ = newNode(P_INPUT, synlineno(), $5, $2, 1, $4); }
@@ -359,6 +392,7 @@ version: Firrtl Version INT '.' INT '.' INT { }
 cir_mods:                       { $$ = new PList(); }
 		| cir_mods module       { $$ = $1; $$->append($2); }
 		| cir_mods extmodule    { $$ = $1; $$->append($2); }
+		| cir_mods choice_domain { $$ = $1; $$->append($2); }
 		| cir_mods layer_decl   { $$ = $1; }
 		| cir_mods intmodule    { TODO(); } // TODO
 		;

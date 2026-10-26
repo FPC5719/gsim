@@ -78,7 +78,14 @@ enum PNodeType{
   P_INVALID,
   P_PARAM_STR,
   P_PARAM_INT,
-  P_PARAMS
+  P_PARAMS,
+  P_CHOICE_DOMAIN,
+  P_CHOICE_CASE,
+  P_CHOICE_TYPE,
+  P_CHOICE_CONST,
+  P_PROP_ASSIGN,
+  P_PARAM_INST_CHOICE,
+  P_CHOICE_ARM
 };
 
 enum PNodeState { VALID_PNODE, CONSTANT_PNODE };
@@ -122,6 +129,7 @@ class PNode {
   int width = 0;
   int lineno;
   bool sign = 0;
+  bool isProbe = false;
   // AggrType* aggrType = NULL;
   int id = -1;
   /**
